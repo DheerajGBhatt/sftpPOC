@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: SAM Template
+Globals:
+  Function:
+    Timeout: 30
+Parameters:
+  SftpUsername:
+    Type: String
+    Default: SFTPUserName
+    Description: SFTP Username
+  SftpPassword:
+    Type: String
+    NoEcho: true
+    Default: Verystrongpassph@se8
+    Description: SFTP Password
+  AzureDomain:
+      Type: String
+      Description: Domain name associated with Azure AD, e.g. example.com
+      NoEcho: true
+      Default: SFT12345678
+  AzureClientId:
+      Type: String
+      Description: Azure Client ID
+      NoEcho: true
+      Default: SFT12345678
+
+Resources:
+  SftpServerS3Buckets:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: my-sftp-buckets
+
+  SftpServer:
+    Type: AWS::Transfer::Server
+    Properties:
+      IdentityProviderType: AWS_LAMBDA
+      SecurityPolicyName: TransferSecurityPolicy-2020-06
+      IdentityProviderDetails:
+        Function: !GetAtt SftpGetUserConfigLambdaFunction.Arn
+        SftpAuthenticationMethods: PASSWORD
+      Protocols:
+        - SFTP
+      EndpointType: PUBLIC
+      LoggingRole:  !GetAtt AWSTransferLoggingAccess.Arn
+      Tags:
+        - Key: Name
+          Value: MySftpServer
+  
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-user-pool
+      UsernameConfiguration:
+        CaseSensitive: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: admin_only
+            Priority: 1
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: True
+          RequireNumbers: True
+          RequireSymbols: True
+          RequireUppercase: True
+          TemporaryPasswordValidityDays: 1
+      UserPoolTags:
+        StackName: !Ref AWS::StackName
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-client
+      GenerateSecret: false
+      UserPoolId: !Ref UserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        # - ALLOW_USER_SRP_AUTH
+
+  AWSTransferLoggingAccess:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - transfer.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: AWSTransferLoggingPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:DescribeLogStreams
+            - logs:PutLogEvents
+            Resource: 'arn:aws:logs:*:*:log-group:/aws/transfer/*'
+
+  SftpUserPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '/SFTP/${SftpUsername}'
+      SecretString: !Sub '{"Password": "${SftpPassword}","Role": "arn:aws:iam::${AWS::AccountId}:role/${SftpAccessRole}","HomeDirectory": "/my-sftp-buckets/home" ,"AzureADDomain" : "${AzureDomain}", "AzureADClientID" : "${AzureClientId}","userpoolid": "${UserPool}" ,"userpoolclientid":"${UserPoolClient}"}'
+  
+  SftpAccessLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: SftpAccessLambdaFunction/
+      Handler: app.lambdaHandler
+      Runtime: nodejs14.x
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonS3FullAccess
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref SftpServerS3Buckets
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix # or "suffix"
+                    Value: home/
+
+  SftpAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'transfer.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref SftpAccessPolicy
+
+  SftpAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: SftpAccessPolicy
+      Description: Sftp access policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Action:
+                - s3:ListBucket
+                - s3:GetBucketLocation
+            Resource: !Sub
+                - 'arn:aws:s3:::${BucketName}'
+                - BucketName: !Ref SftpServerS3Buckets
+          - 
+            Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:DeleteObjectVersion
+            - s3:DeleteObject
+            - s3:GetObjectVersion
+            Resource: !Sub
+                - 'arn:aws:s3:::${BucketName}/*/*'
+                - BucketName: !Ref SftpServerS3Buckets
+     
+  SftpGetUserConfigLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: SftpGetUserLambdaFunction/
+      Handler: app.lambdaHandler
+      Runtime: nodejs14.x
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonS3FullAccess
+        - Statement:
+          - Sid: VisualEditor
+            Effect: Allow
+            Action:
+              - 'secretsmanager:GetSecretValue'
+              - 'logs:CreateLogGroup'
+            Resource:
+              - !Ref SftpUserPassword
+      Environment:
+        Variables:
+          SecretsManagerRegion: !Ref "AWS::Region"
+
+  SftpGetUserConfigLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SftpGetUserConfigLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: transfer.amazonaws.com
+      SourceArn: !GetAtt SftpServer.Arn
+
+  SftpAzureLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: SftpAzureLambdaFunction/
+      Handler: app.lambdaHandler
+      Runtime: nodejs14.x
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonS3FullAccess
+        - Statement:
+          - Sid: VisualEditor
+            Effect: Allow
+            Action:
+              - 'secretsmanager:GetSecretValue'
+              - 'logs:CreateLogGroup'
+            Resource:
+              - !Ref SftpUserPassword
+      Environment:
+        Variables:
+          AzureClientId: !Ref AzureClientId
+          AzureDomain: !Ref AzureDomain
+          AzureClientIdSecretKey: AzureADClientID
+          AzureSecrets: !Sub '/SFTP/${SftpUsername}'
+          AzureDomainSecretKey: AzureADDomain
+          Region: !Ref "AWS::Region"
+          S3BucketName: !Ref SftpServerS3Buckets
+          TransferRoleARN: !GetAtt SftpAccessRole.Arn
+
+  SftpAzureLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SftpAzureLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: transfer.amazonaws.com
+      SourceArn: !GetAtt SftpServer.Arn
+
+  SftpCognitoLambdaFunction:
+      Type: AWS::Serverless::Function
+      Properties:
+        CodeUri: SftpCognitoLambdaFunction/
+        Handler: app.lambdaHandler
+        Environment:
+          Variables:
+            bucketname: !Ref SftpServerS3Buckets
+            TransferAccessRole: !GetAtt SftpAccessRole.Arn
+            SecretsManagerRegion: !Ref "AWS::Region"
+            UserPool: !Ref UserPool
+        Description: A function to provide IAM roles and policies for given user and serverId.
+        Runtime: nodejs14.x
+        Policies:
+          - AWSLambdaBasicExecutionRole
+          - AmazonS3FullAccess
+          - Statement:
+            - Sid: VisualEditor
+              Effect: Allow
+              Action:
+                - 'secretsmanager:GetSecretValue'
+                - 'logs:CreateLogGroup'
+              Resource:
+                - !Ref SftpUserPassword
+          - Statement:
+            - Sid: VisualEditor1
+              Effect: Allow
+              Action:
+                - cognito-idp:InitiateAuth
+                - cognito-idp:AdminSetUserPassword
+              Resource:
+                - !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPool}"
+          - Statement:
+            - Sid: VisualEditor2
+              Effect: Allow
+              Action:
+                - cognito-idp:AdminSetUserPassword
+              Resource:
+                - !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPool}/*"  
+  
+  SftpCognitoLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SftpCognitoLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: transfer.amazonaws.com
+      SourceArn: !GetAtt SftpServer.Arn
+
+  ObjectLambdaAccessPoint:
+    Type: AWS::S3ObjectLambda::AccessPoint
+    Properties:
+      Name: sftpbjectlambdaaccesspoint
+      ObjectLambdaConfiguration:
+        SupportingAccessPoint: !GetAtt SupportingAccessPoint.Arn
+        AllowedFeatures:
+          - GetObject-Range
+          - GetObject-PartNumber
+          - HeadObject-Range
+          - HeadObject-PartNumber
+        TransformationConfigurations:
+          - Actions: [ GetObject, ListObjects, ListObjectsV2, HeadObject ]
+            ContentTransformation:
+              AwsLambda:
+                FunctionArn: !GetAtt SftpAccessLambdaFunction.Arn
+                FunctionPayload: !Ref SftpAccessLambdaFunction
+
+  SupportingAccessPoint:
+    Type: AWS::S3::AccessPoint
+    Properties:
+      Bucket: !Ref SftpServerS3Buckets
+
+Outputs:
+  ObjectLambdaAccessPoint:
+    Description: The Amazon S3 Object Lambda Access Point created by this CloudFormation stack.
+    Value: !Ref ObjectLambdaAccessPoint

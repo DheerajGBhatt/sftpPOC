@@ -1,0 +1,1 @@
+{"appName":"sftpPOC","language":"node","rover_create_project":[{"stackDetails":{"BaseModuleFnecq":{"type":"BaseModule","params":{},"componentList":[]}}}],"rover_add_component":[{"nested":true,"fileName":"sftpPOC/template.yaml\n","nestedComponents":{"BaseModuleFnecq":{"components":["S3 Lambda"],"path":"BaseModuleFnecq/template.yaml"}}}]}
